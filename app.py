@@ -22,10 +22,9 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
-st.title("🎧 Text-to-SQL Analyst")
+st.title("Text-to-SQL Analyst")
 st.caption(
-    "Ask a business question in plain English and get back SQL, results, a chart, and a "
-    "plain-English explanation. Upload your own CSV/Excel/JSON to query your own data."
+    "Ask a business question in plain English and get back SQL, results, a chart, and an explanation. Upload your own CSV/Excel/JSON to query your own data!"
 )
 
 # --- Data source: upload or demo -------------------------------------------
@@ -72,7 +71,7 @@ with st.expander("Data source", expanded=(st.session_state.active_db == DB_PATH 
             st.rerun()
 
 using_own_data = st.session_state.active_db != DB_PATH
-st.info("Querying **your uploaded data**" if using_own_data else "Querying the **demo Chinook database**", icon=" ⟟ ")
+st.info("Querying **your uploaded data**" if using_own_data else "Querying the **demo Chinook database**", icon=" 📌 ")
 
 # --- Sidebar: recent query history -----------------------------------------
 with st.sidebar:
