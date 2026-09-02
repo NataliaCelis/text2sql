@@ -1,6 +1,5 @@
 """Offline demo mode: maps a fixed set of example questions to pre-written
-SQL so the app is fully demoable without an API key. Used only when
-ANTHROPIC_API_KEY is not set."""
+SQL so the app is fully demoable without an API key."""
 
 DEMO_QUERIES = {
     "top 5 artists by revenue": """
