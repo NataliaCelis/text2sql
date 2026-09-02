@@ -71,7 +71,7 @@ with st.expander("Data source", expanded=(st.session_state.active_db == DB_PATH 
             st.rerun()
 
 using_own_data = st.session_state.active_db != DB_PATH
-st.info("Querying **your uploaded data**" if using_own_data else "Querying the **demo Chinook database**", icon=" 📌 ")
+st.info("Querying **your uploaded data**" if using_own_data else "Querying the **demo Chinook database**")
 
 # --- Sidebar: recent query history -----------------------------------------
 with st.sidebar:
