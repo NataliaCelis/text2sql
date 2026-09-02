@@ -53,14 +53,15 @@ def _client():
     return anthropic.Anthropic(api_key=api_key)
 
 
-def generate_sql(question: str, history: list = None, prior_error: str = None, prior_sql: str = None) -> str:
+def generate_sql(question: str, db_path: str = None, history: list = None, prior_error: str = None, prior_sql: str = None) -> str:
     """Calls Claude to translate a question into SQL.
+    db_path: which SQLite DB's schema to use as context (defaults to Chinook).
     history: list of {"question": str, "sql": str} from earlier turns, for
              multi-turn follow-up questions.
     prior_error/prior_sql: when retrying after a failed execution, passes the
              broken SQL and the DB error back so the model can fix it."""
     client = _client()
-    schema_text = get_schema_text()
+    schema_text = get_schema_text(db_path or DB_PATH)
 
     convo_context = ""
     if history:
@@ -104,6 +105,31 @@ def explain_sql(sql: str) -> str:
     return resp.content[0].text.strip()
 
 
+SUGGEST_SYSTEM_PROMPT = """Given a SQLite schema, suggest 4 interesting, specific business
+questions a user could ask about this data. Output ONLY the 4 questions, one per line,
+no numbering, no bullets, no extra commentary. Make them concrete (reference actual
+column/table names in spirit, not literally) and varied (aggregation, ranking, trend,
+comparison)."""
+
+
+def suggest_questions(db_path: str) -> list:
+    """Returns 4 example questions tailored to the given DB's schema.
+    Returns [] in demo mode (no API key)."""
+    try:
+        client = _client()
+    except SQLGenerationError:
+        return []
+    schema_text = get_schema_text(db_path)
+    resp = client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=200,
+        system=SUGGEST_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": f"SCHEMA:\n{schema_text}"}],
+    )
+    lines = [l.strip("-• \t") for l in resp.content[0].text.strip().split("\n") if l.strip()]
+    return lines[:4]
+
+
 def validate_sql(sql: str) -> None:
     stripped = sql.strip().rstrip(";")
     if not stripped:
@@ -126,34 +152,41 @@ def run_sql(sql: str, db_path: str = DB_PATH) -> pd.DataFrame:
     return df
 
 
-def ask(question: str, history: list = None) -> dict:
+def ask(question: str, db_path: str = None, history: list = None) -> dict:
     """Full pipeline: question -> SQL -> validated -> executed -> result,
     with up to MAX_RETRIES self-healing attempts on execution failure.
+    db_path: which SQLite DB to query (defaults to the Chinook demo DB).
     Returns dict: sql, result, error, mode, retries, explanation."""
+    active_db = db_path or DB_PATH
     try:
-        sql = generate_sql(question, history=history)
+        sql = generate_sql(question, db_path=active_db, history=history)
         mode = "live"
     except SQLGenerationError:
         from demo_fallback import match_demo_query
-        sql = match_demo_query(question)
+        # demo fallback only makes sense against the built-in Chinook DB
+        sql = match_demo_query(question) if active_db == DB_PATH else None
         mode = "demo"
         if sql is None:
             log_query(question, None, "demo", success=False, error="no demo match")
+            reason = (
+                "No ANTHROPIC_API_KEY configured, and this question doesn't "
+                "match a demo example. Set ANTHROPIC_API_KEY to enable live "
+                "generation, or try one of the example questions."
+                if active_db == DB_PATH else
+                "No ANTHROPIC_API_KEY configured. Live SQL generation is "
+                "required to query your uploaded data (demo mode only "
+                "covers the built-in Chinook dataset)."
+            )
             return {
                 "sql": None, "result": None, "explanation": None, "retries": 0,
-                "error": (
-                    "No ANTHROPIC_API_KEY configured, and this question doesn't "
-                    "match a demo example. Set ANTHROPIC_API_KEY to enable live "
-                    "generation, or try one of the example questions."
-                ),
-                "mode": "demo",
+                "error": reason, "mode": "demo",
             }
 
     retries = 0
     last_error = None
     while True:
         try:
-            df = run_sql(sql)
+            df = run_sql(sql, db_path=active_db)
             explanation = explain_sql(sql) if mode == "live" else None
             log_query(question, sql, mode, success=True, retries=retries)
             return {
@@ -171,7 +204,7 @@ def ask(question: str, history: list = None) -> dict:
             # self-healing retry: feed the error back to the model
             retries += 1
             try:
-                sql = generate_sql(question, history=history, prior_error=last_error, prior_sql=sql)
+                sql = generate_sql(question, db_path=active_db, history=history, prior_error=last_error, prior_sql=sql)
             except SQLGenerationError:
                 log_query(question, sql, mode, success=False, retries=retries, error=last_error)
                 return {

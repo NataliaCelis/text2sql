@@ -26,5 +26,14 @@ def get_schema_text(db_path: str = DB_PATH) -> str:
     return "\n".join(lines)
 
 
+def get_table_names(db_path: str) -> list:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    tables = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return tables
+
+
 if __name__ == "__main__":
     print(get_schema_text())
