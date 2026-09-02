@@ -81,7 +81,7 @@ def generate_sql(question: str, db_path: str = None, history: list = None, prior
         user_prompt = f"SCHEMA:\n{schema_text}\n{convo_context}\nQUESTION: {question}\n\nSQL:"
 
     resp = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-5",
         max_tokens=400,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
@@ -97,7 +97,7 @@ def explain_sql(sql: str) -> str:
     except SQLGenerationError:
         return None
     resp = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-5",
         max_tokens=150,
         system=EXPLAIN_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": sql}],
@@ -121,7 +121,7 @@ def suggest_questions(db_path: str) -> list:
         return []
     schema_text = get_schema_text(db_path)
     resp = client.messages.create(
-        model="claude-sonnet-4-5",
+        model="claude-sonnet-5",
         max_tokens=200,
         system=SUGGEST_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"SCHEMA:\n{schema_text}"}],
