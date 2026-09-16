@@ -1,10 +1,7 @@
-"""Test suite: safety validation, demo fallback, the agentic tool-use loop,
-and end-to-end execution.
+"""Test suite: safety validation, demo fallback, and end-to-end execution.
 Run with: pytest tests/ -v
 Tests that need a live API key are skipped automatically when
-ANTHROPIC_API_KEY isn't set, so this suite runs cleanly in CI. The agent-loop
-tests instead fake the Claude client, so they exercise the real retry/finish
-logic deterministically without any network access."""
+ANTHROPIC_API_KEY isn't set, so this suite runs cleanly in CI."""
 import os
 import sys
 import pytest
@@ -106,10 +103,6 @@ def test_ask_live_mode_generates_valid_sql():
     assert result["result"].shape[0] >= 1
 
 
-# ---------------------------------------------------------------------------
-# Agentic tool-use loop - fakes the Claude client so the real retry/finish
-# logic in sql_engine._run_agent runs deterministically, with no network.
-# ---------------------------------------------------------------------------
 class FakeBlock:
     def __init__(self, type_, name=None, id=None, input=None):
         self.type = type_
@@ -153,9 +146,6 @@ def test_run_agent_self_heals_after_execution_error(monkeypatch):
 
 
 def test_run_agent_enforces_select_only_even_if_model_tries_unsafe_sql(monkeypatch):
-    """The execute_sql tool independently re-validates every query - a model
-    that tries DROP/DELETE/etc. gets a rejection back as a tool error, not a
-    mutated database."""
     responses = [
         FakeResponse([FakeBlock("tool_use", name="execute_sql", id="1", input={"sql": "DROP TABLE Customer"})]),
         FakeResponse([FakeBlock("tool_use", name="execute_sql", id="2", input={"sql": "SELECT COUNT(*) AS n FROM Customer"})]),
@@ -168,7 +158,7 @@ def test_run_agent_enforces_select_only_even_if_model_tries_unsafe_sql(monkeypat
     assert result["retries"] == 1
     assert result["error"] is None
     row_count = run_sql("SELECT COUNT(*) AS n FROM Customer")["n"].iloc[0]
-    assert row_count > 0  # table still exists - the DROP never reached the database
+    assert row_count > 0
 
 
 def test_run_agent_gives_up_after_max_retries(monkeypatch):

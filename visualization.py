@@ -1,10 +1,4 @@
-"""Agentic visualization: after a query result comes back, the model looks at
-the question, the SQL, and the shape of the result (columns, dtypes, a sample
-of rows) and decides how best to chart it - bar/line/area/scatter/pie, which
-columns go on which axis, or "table" when a chart wouldn't help. In demo mode
-(no API key) a simple heuristic takes over instead. Charts render with Plotly
-so results are interactive: hover tooltips, zoom/pan, and toggleable legends,
-rather than a static image."""
+"""Agentic chart selection + interactive Plotly rendering."""
 import json
 import pandas as pd
 import plotly.express as px
@@ -30,15 +24,12 @@ Rules:
 
 
 def heuristic_chart(df: pd.DataFrame) -> dict:
-    """No-API-key / no-LLM fallback: chart the first two columns if the second is numeric."""
     if df.shape[1] >= 2 and df.shape[0] > 1 and pd.api.types.is_numeric_dtype(df[df.columns[1]]):
         return {"chart": "bar", "x": df.columns[0], "y": df.columns[1], "color": None, "reason": "default heuristic"}
     return {"chart": "table", "x": None, "y": None, "color": None, "reason": "default heuristic"}
 
 
 def choose_chart(question: str, sql: str, df: pd.DataFrame) -> dict:
-    """Agentic visualization step: asks Claude how to best chart this result.
-    Falls back to a heuristic if no API key is configured or the call/parse fails."""
     try:
         client = _client()
     except SQLGenerationError:
@@ -72,8 +63,6 @@ def choose_chart(question: str, sql: str, df: pd.DataFrame) -> dict:
 
 
 def render_chart(df: pd.DataFrame, choice: dict):
-    """Builds an interactive Plotly figure for the given chart choice, or
-    returns None for "table" / when there isn't enough data to plot."""
     if df.empty or not choice:
         return None
     chart = choice.get("chart")

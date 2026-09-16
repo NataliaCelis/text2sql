@@ -1,15 +1,4 @@
-"""Core engine: an agentic pipeline that turns a natural-language question into
-validated, executed SQL.
-
-Rather than a hard-coded generate -> execute -> retry loop, the model drives an
-explicit tool-use loop: it calls the execute_sql tool with its query, sees the
-real database error (or a preview of the result) come back as the tool result,
-and decides for itself whether to retry with a corrected query or call finish
-once the result actually answers the question. Every execute_sql call is
-independently validated (SELECT-only, single statement) before it ever touches
-the database - the model choosing to call the tool doesn't bypass that check -
-and the loop is hard-capped at MAX_RETRIES so a stubborn model can't spin
-forever."""
+"""Agentic pipeline: Claude drives an execute_sql/finish tool loop to turn a question into validated, executed SQL."""
 import os
 import re
 import json
@@ -115,8 +104,7 @@ def _client():
 
 
 def suggest_questions(db_path: str) -> list:
-    """Returns 4 example questions tailored to the given DB's schema.
-    Returns [] in demo mode (no API key)."""
+    """[] in demo mode (no API key)."""
     try:
         client = _client()
     except SQLGenerationError:
@@ -155,7 +143,6 @@ def run_sql(sql: str, db_path: str = DB_PATH) -> pd.DataFrame:
 
 
 def _execute_tool(sql: str, db_path: str):
-    """Runs one execute_sql tool call. Returns (tool_result_payload, df, error)."""
     try:
         validate_sql(sql)
         df = run_sql(sql, db_path=db_path)
@@ -172,9 +159,7 @@ def _execute_tool(sql: str, db_path: str):
 
 
 def _run_agent(question: str, db_path: str, history: list) -> dict:
-    """Drives the execute_sql/finish tool-use loop against Claude.
-    Returns an ask()-shaped dict with mode='live'. Raises SQLGenerationError
-    if no API key is configured (caller falls back to demo mode)."""
+    """Raises SQLGenerationError if no API key is configured."""
     client = _client()
     schema_text = get_schema_text(db_path)
 
@@ -192,7 +177,6 @@ def _run_agent(question: str, db_path: str, history: list) -> dict:
     retries = 0
     explanation = None
 
-    # +2 headroom so the model can still call finish right after its last retry succeeds
     for _ in range(MAX_RETRIES + 2):
         resp = client.messages.create(
             model=MODEL, max_tokens=800, system=AGENT_SYSTEM_PROMPT,
@@ -202,7 +186,7 @@ def _run_agent(question: str, db_path: str, history: list) -> dict:
 
         calls = [b for b in resp.content if b.type == "tool_use"]
         if not calls:
-            break  # model didn't call a tool - nothing more we can drive
+            break
 
         tool_results = []
         finished = False
@@ -253,15 +237,11 @@ def _run_agent(question: str, db_path: str, history: list) -> dict:
 
 
 def ask(question: str, db_path: str = None, history: list = None) -> dict:
-    """Full pipeline: question -> agentic tool-use loop -> validated, executed SQL.
-    db_path: which SQLite DB to query (defaults to the Chinook demo DB).
-    Returns dict: sql, result, error, mode, retries, explanation."""
     active_db = db_path or DB_PATH
     try:
         result = _run_agent(question, active_db, history)
     except SQLGenerationError:
         from demo_fallback import match_demo_query
-        # demo fallback only makes sense against the built-in Chinook DB
         sql = match_demo_query(question) if active_db == DB_PATH else None
         if sql is None:
             log_query(question, None, "demo", success=False, error="no demo match")

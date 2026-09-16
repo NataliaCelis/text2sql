@@ -1,6 +1,4 @@
-"""Tests for visualization.py - chart selection and rendering.
-No ANTHROPIC_API_KEY is required: choose_chart() falls back to the heuristic
-whenever no key is configured, so these run the same way in CI."""
+"""Tests for visualization.py - chart selection and rendering."""
 import os
 import sys
 import pandas as pd
@@ -11,9 +9,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from visualization import heuristic_chart, choose_chart, render_chart
 
 
-# ---------------------------------------------------------------------------
-# heuristic_chart
-# ---------------------------------------------------------------------------
 def test_heuristic_picks_bar_for_category_and_numeric():
     df = pd.DataFrame({"Country": ["US", "CA", "UK"], "Count": [10, 5, 3]})
     choice = heuristic_chart(df)
@@ -32,9 +27,6 @@ def test_heuristic_falls_back_to_table_for_non_numeric_second_column():
     assert heuristic_chart(df)["chart"] == "table"
 
 
-# ---------------------------------------------------------------------------
-# choose_chart - demo mode (no API key) always uses the heuristic
-# ---------------------------------------------------------------------------
 def test_choose_chart_uses_heuristic_without_api_key(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     df = pd.DataFrame({"Genre": ["Rock", "Jazz"], "Revenue": [100.0, 50.0]})
@@ -42,9 +34,6 @@ def test_choose_chart_uses_heuristic_without_api_key(monkeypatch):
     assert choice == heuristic_chart(df)
 
 
-# ---------------------------------------------------------------------------
-# render_chart
-# ---------------------------------------------------------------------------
 def test_render_chart_returns_none_for_table_choice():
     df = pd.DataFrame({"Total": [42]})
     assert render_chart(df, {"chart": "table", "x": None, "y": None, "color": None}) is None
