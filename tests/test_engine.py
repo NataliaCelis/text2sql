@@ -163,7 +163,7 @@ def test_run_agent_enforces_select_only_even_if_model_tries_unsafe_sql(monkeypat
 
 def test_run_agent_gives_up_after_max_retries(monkeypatch):
     bad_call = lambda i: FakeResponse([FakeBlock("tool_use", name="execute_sql", id=str(i), input={"sql": "SELECT * FROM NoSuchTable"})])
-    responses = [bad_call(i) for i in range(sql_engine.MAX_RETRIES + 2)]
+    responses = [bad_call(i) for i in range(sql_engine.MAX_RETRIES + 1)]
     monkeypatch.setattr(sql_engine, "_client", lambda: FakeClient(responses))
 
     result = sql_engine._run_agent("a question the model can't answer", sql_engine.DB_PATH, None)
@@ -171,3 +171,50 @@ def test_run_agent_gives_up_after_max_retries(monkeypatch):
     assert result["error"] is not None
     assert result["result"] is None
     assert result["retries"] == sql_engine.MAX_RETRIES
+
+
+def test_run_agent_explores_schema_before_querying(monkeypatch):
+    responses = [
+        FakeResponse([FakeBlock("tool_use", name="list_tables", id="1", input={})]),
+        FakeResponse([FakeBlock("tool_use", name="describe_table", id="2", input={"table": "Customer"})]),
+        FakeResponse([FakeBlock("tool_use", name="execute_sql", id="3", input={"sql": "SELECT COUNT(*) AS n FROM Customer"})]),
+        FakeResponse([FakeBlock("tool_use", name="visualize", id="4", input={"chart": "table", "reason": "single scalar value"})]),
+        FakeResponse([FakeBlock("tool_use", name="finish", id="5", input={"explanation": "Counts customers."})]),
+    ]
+    monkeypatch.setattr(sql_engine, "_client", lambda: FakeClient(responses))
+
+    result = sql_engine._run_agent("how many customers are there", sql_engine.DB_PATH, None)
+
+    assert result["error"] is None
+    assert result["chart"] == {"chart": "table", "x": None, "y": None, "color": None, "reason": "single scalar value"}
+    assert result["explanation"] == "Counts customers."
+
+
+def test_run_agent_recovers_from_describe_table_on_unknown_table(monkeypatch):
+    responses = [
+        FakeResponse([FakeBlock("tool_use", name="describe_table", id="1", input={"table": "NotARealTable"})]),
+        FakeResponse([FakeBlock("tool_use", name="execute_sql", id="2", input={"sql": "SELECT COUNT(*) AS n FROM Customer"})]),
+        FakeResponse([FakeBlock("tool_use", name="finish", id="3", input={"explanation": "ok"})]),
+    ]
+    monkeypatch.setattr(sql_engine, "_client", lambda: FakeClient(responses))
+
+    result = sql_engine._run_agent("describe a table that doesn't exist", sql_engine.DB_PATH, None)
+
+    assert result["error"] is None
+    assert result["result"]["n"].iloc[0] > 0
+
+
+def test_run_agent_blocks_visualize_and_finish_before_a_successful_query(monkeypatch):
+    responses = [
+        FakeResponse([FakeBlock("tool_use", name="visualize", id="1", input={"chart": "bar", "reason": "premature"})]),
+        FakeResponse([FakeBlock("tool_use", name="finish", id="2", input={"explanation": "premature"})]),
+        FakeResponse([FakeBlock("tool_use", name="execute_sql", id="3", input={"sql": "SELECT COUNT(*) AS n FROM Customer"})]),
+        FakeResponse([FakeBlock("tool_use", name="finish", id="4", input={"explanation": "Counts customers."})]),
+    ]
+    monkeypatch.setattr(sql_engine, "_client", lambda: FakeClient(responses))
+
+    result = sql_engine._run_agent("how many customers are there", sql_engine.DB_PATH, None)
+
+    assert result["error"] is None
+    assert result["chart"] is None
+    assert result["explanation"] == "Counts customers."

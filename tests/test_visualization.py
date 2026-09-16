@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from visualization import heuristic_chart, choose_chart, render_chart
+from visualization import heuristic_chart, render_chart
 
 
 def test_heuristic_picks_bar_for_category_and_numeric():
@@ -25,13 +25,6 @@ def test_heuristic_falls_back_to_table_for_single_row():
 def test_heuristic_falls_back_to_table_for_non_numeric_second_column():
     df = pd.DataFrame({"Id": [1, 2, 3], "Name": ["a", "b", "c"]})
     assert heuristic_chart(df)["chart"] == "table"
-
-
-def test_choose_chart_uses_heuristic_without_api_key(monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    df = pd.DataFrame({"Genre": ["Rock", "Jazz"], "Revenue": [100.0, 50.0]})
-    choice = choose_chart("total revenue by genre", "SELECT ...", df)
-    assert choice == heuristic_chart(df)
 
 
 def test_render_chart_returns_none_for_table_choice():

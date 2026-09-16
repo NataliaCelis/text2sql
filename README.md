@@ -3,17 +3,22 @@
 A self-healing LLM analytics agent that turns plain-English business questions
 into validated SQL, executes it against your uploaded datasets (or a built-in
 demo database), and generates interactive visualizations — with SELECT-only
-safeguards enforced independently of the model. Claude drives its own
-`execute_sql` / `finish` tool-use loop: it writes a query, sees the real
-database error (or result) come back, and decides for itself whether to
-retry with a fix or stop. Supports follow-up questions.
+safeguards enforced independently of the model. Claude isn't handed a schema
+and a fixed pipeline; it's given five tools (`list_tables`, `describe_table`,
+`execute_sql`, `visualize`, `finish`) and works the problem itself — deciding
+what to explore, when to retry, and how to chart the result. Supports
+follow-up questions.
 
 ## Features
-- **Agentic SQL generation** — Claude doesn't just emit SQL once; it calls an
-  `execute_sql` tool, reads back the real database error or result, and
-  decides on its own whether to retry with a corrected query or call `finish`.
-  Every `execute_sql` call is independently re-validated (SELECT-only, single
-  statement) before it touches the database, regardless of what the model asks for.
+- **Agentic, tool-driven pipeline** — Claude gets no schema up front. It
+  explores the database itself (`list_tables`, `describe_table`), writes and
+  runs SQL (`execute_sql`), reads back the real database error or result,
+  and decides on its own whether to retry with a corrected query, look at
+  another table, chart the result (`visualize`), or stop (`finish`). The
+  loop doesn't script that sequence — it just executes whichever tool the
+  model calls next, up to a hard step cap. Every `execute_sql` call is
+  independently re-validated (SELECT-only, single statement) before it
+  touches the database, regardless of what the model asks for.
 - **Bring your own data** — upload one or more CSV/Excel/JSON files and
   they're loaded into a session-scoped SQLite database. Multiple
   files can be joined in the same question (e.g. a `customers.csv` +
@@ -28,22 +33,24 @@ retry with a fix or stop. Supports follow-up questions.
 - **Multi-turn conversation** — follow-ups like "now break that down by
   country" resolve against the last 3 turns of context.
 - **Plain-English explanation** under every query.
-- **Agentic, interactive visualization** — once a query succeeds, a second
-  Claude call looks at the question and the shape of the result and picks a
-  chart type (bar/line/area/scatter/pie, or "table" when a chart wouldn't
-  help) and which columns go on which axis. Rendered with Plotly for real
-  interactivity — hover tooltips, zoom/pan, toggleable legends — with a
-  manual override and a graceful heuristic fallback in demo mode.
+- **Interactive visualization, chosen by the same agent** — once a query
+  succeeds, the agent's own `visualize` tool call picks a chart type
+  (bar/line/area/scatter/pie, or "table" when a chart wouldn't help) and
+  which columns go on which axis, in the same tool-use session as the SQL -
+  no separate LLM call. Rendered with Plotly for real interactivity — hover
+  tooltips, zoom/pan, toggleable legends — with a manual override and a
+  heuristic fallback in demo mode.
 - **Suggested questions** — a button that asks Claude to propose 4 relevant
   questions tailored to your specific uploaded schema.
 - **Editable SQL** — every result has an "Edit & re-run" panel so a SQL-
   literate user can tweak the generated query directly.
 - **Query history** — sidebar shows the last 10; a Full History tab shows
   the last 50 with one-click re-run of any past question.
-- **Tested + CI'd** — a pytest suite (45 tests: safety validation, the
-  agentic tool-use loop, demo fallback, execution, upload/sanitization,
-  multi-file joins, profiling, visualization, full pipeline) runs
-  automatically on every push via GitHub Actions.
+- **Tested + CI'd** — a pytest suite (48 tests: safety validation, the
+  agentic tool loop and its schema-exploration/visualize/finish gating,
+  demo fallback, execution, upload/sanitization, multi-file joins,
+  profiling, visualization, full pipeline) runs automatically on every push
+  via GitHub Actions.
 
 ## Architecture
 ```
@@ -51,33 +58,35 @@ upload (CSV/Excel/JSON) -> data_loader.py -> session-scoped SQLite DB
         (or) demo Chinook DB
                 |
 question (Streamlit UI, with conversation history)
-      -> schema.py                    builds table/column/FK context for active DB
-      -> sql_engine._run_agent()      Claude drives its own tool-use loop:
-           execute_sql tool  -> sql_engine.validate_sql()   SELECT-only safety check
-                              -> sql_engine.run_sql()        executes against the active DB
+      -> sql_engine._run_agent()   Claude drives its own tool loop, calling
+                                    whichever of these it needs, in whatever order:
+           list_tables      -> schema.list_tables_with_counts()   table names + row counts
+           describe_table    -> schema.get_table_schema()          one table's columns/types/FKs
+           execute_sql       -> sql_engine.validate_sql()          SELECT-only safety check
+                              -> sql_engine.run_sql()               executes against the active DB
                                  on failure: DB error returned as the tool result,
                                  model decides whether to retry (up to MAX_RETRIES)
-           finish tool       -> plain-English explanation, ends the loop
-      -> visualization.choose_chart()  agentic chart-type + axis selection
-      -> visualization.render_chart()  interactive Plotly figure
-      -> query_log.log_query()         every attempt logged
-      -> Streamlit                     shows SQL + explanation + result + chart + CSV download
+           visualize         -> chart type + axis choice, gated on a successful execute_sql
+           finish            -> plain-English explanation, ends the loop
+      -> visualization.render_chart()   interactive Plotly figure from the agent's choice
+      -> query_log.log_query()          every attempt logged
+      -> Streamlit                      shows SQL + explanation + result + chart + CSV download
 ```
 
 ## Files
 ```
 app.py                Streamlit UI - tabbed: Ask / Data Preview / Full History
-sql_engine.py          agentic tool-use loop, validation, execution, suggestions
-visualization.py        agentic chart selection + interactive Plotly rendering
-schema.py               extracts schema text + table list for any SQLite DB
+sql_engine.py          agentic tool loop (explore/execute/visualize/finish), validation, suggestions
+visualization.py        heuristic chart fallback (demo mode) + interactive Plotly rendering
+schema.py               full-schema text, per-table schema, and table/row-count listing
 profiling.py            table preview, row counts, column-level stats
 data_loader.py           CSV/Excel/JSON upload -> sanitized, session-scoped SQLite DB
 demo_fallback.py         offline demo mode (no API key required, Chinook DB only)
 query_log.py             logs every query to data/query_log.db
-tests/test_engine.py      pytest: safety, agentic loop, demo, execution, full pipeline
+tests/test_engine.py      pytest: safety, agentic loop + tool gating, demo, execution, full pipeline
 tests/test_data_loader.py   pytest: sanitization, upload, joins, schema
 tests/test_profiling.py     pytest: preview, row counts, column stats
-tests/test_visualization.py  pytest: chart selection heuristic + Plotly rendering
+tests/test_visualization.py  pytest: chart heuristic + Plotly rendering
 .github/workflows/ci.yml   GitHub Actions: runs pytest on every push
 data/chinook.db            demo SQLite DB (customers, invoices, tracks, artists...)
 tmp_uploads/                session-scoped DBs built from user uploads (gitignored)

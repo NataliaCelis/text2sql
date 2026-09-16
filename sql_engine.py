@@ -1,41 +1,66 @@
-"""Agentic pipeline: Claude drives an execute_sql/finish tool loop to turn a question into validated, executed SQL."""
+"""Agentic pipeline: Claude drives an explore/execute/visualize/finish tool loop to turn a question into validated, executed SQL and a chart choice."""
 import os
 import re
 import json
 import sqlite3
 import pandas as pd
-from schema import get_schema_text
+from schema import get_schema_text, list_tables_with_counts, get_table_schema
 from query_log import log_query
 
 DB_PATH = "data/chinook.db"
 MAX_RETRIES = 2
+MAX_STEPS = 8
 MODEL = "claude-sonnet-5"
+CHART_TYPES = {"bar", "line", "area", "scatter", "pie", "table"}
 
 AGENT_SYSTEM_PROMPT = """You are a SQL analytics agent for a SQLite database. You
-answer business questions by calling tools - you never just print SQL as plain text.
+answer business questions by calling tools - you never just print SQL, a chart
+choice, or an explanation as plain text.
 
-Workflow:
+You are not given the schema up front - explore it yourself:
+- Call list_tables to see what's available (name + row count).
+- Call describe_table for any table you plan to query, to see its columns, types,
+  and foreign keys. Only describe tables you actually need.
+
+Then:
 1. Call execute_sql with a single SQLite SELECT query that answers the question.
 2. Look at what comes back:
    - If it's an error, read it, fix the query, and call execute_sql again.
    - If it's a result, decide whether it actually answers the question. If not
      (wrong grouping, wrong columns, empty when it shouldn't be), fix the query
      and call execute_sql again.
-3. Once a result correctly answers the question, call finish with a short,
-   plain-English explanation of what the query computes (for a non-technical
-   business stakeholder - no SQL jargon, no restating the query syntax).
+3. Once a result correctly answers the question, call visualize to choose how (or
+   whether) to chart it - pick "table" if a chart wouldn't help.
+4. Call finish with a short, plain-English explanation of what the query computes
+   (for a non-technical business stakeholder - no SQL jargon).
 
 Rules:
 - Only SELECT queries. Never INSERT, UPDATE, DELETE, DROP, ALTER, etc. - these
   are rejected before they ever reach the database.
-- Use table/column names exactly as given in the schema.
+- Use table/column names exactly as returned by list_tables / describe_table.
 - If prior conversation turns are given, use them to resolve references like
   "that", "those", "the same but by X" in the current question.
 - Limit results to 100 rows unless the question implies otherwise (add LIMIT 100).
-- You have a limited number of execute_sql attempts - make each one count.
+- You have a limited number of tool calls - explore only what you need.
 """
 
 TOOLS = [
+    {
+        "name": "list_tables",
+        "description": "Lists every table in the target database with its row count.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "describe_table",
+        "description": "Returns a table's column names, types, and foreign keys.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "table": {"type": "string", "description": "Exact table name, as returned by list_tables."}
+            },
+            "required": ["table"],
+        },
+    },
     {
         "name": "execute_sql",
         "description": (
@@ -50,6 +75,21 @@ TOOLS = [
                 "sql": {"type": "string", "description": "A single SQLite SELECT statement."}
             },
             "required": ["sql"],
+        },
+    },
+    {
+        "name": "visualize",
+        "description": "Call once, after execute_sql has succeeded, to choose how the result should be charted.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "chart": {"type": "string", "enum": sorted(CHART_TYPES)},
+                "x": {"type": "string", "description": "Column for the x-axis/category. Omit if not applicable."},
+                "y": {"type": "string", "description": "Column for the y-axis/value. Omit if not applicable."},
+                "color": {"type": "string", "description": "Column to split by color/series. Omit if not applicable."},
+                "reason": {"type": "string", "description": "One short sentence explaining the choice."},
+            },
+            "required": ["chart", "reason"],
         },
     },
     {
@@ -85,14 +125,6 @@ FORBIDDEN = re.compile(
 
 class SQLGenerationError(Exception):
     pass
-
-
-def _strip_code_fences(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```sql\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^```\s*", "", text)
-    text = re.sub(r"```$", "", text)
-    return text.strip()
 
 
 def _client():
@@ -161,23 +193,20 @@ def _execute_tool(sql: str, db_path: str):
 def _run_agent(question: str, db_path: str, history: list) -> dict:
     """Raises SQLGenerationError if no API key is configured."""
     client = _client()
-    schema_text = get_schema_text(db_path)
 
     convo_context = ""
     if history:
         turns = "\n".join(f"Q: {h['question']}\nSQL: {h['sql']}" for h in history[-3:])
-        convo_context = f"\nPRIOR CONVERSATION (for resolving references):\n{turns}\n"
+        convo_context = f"PRIOR CONVERSATION (for resolving references):\n{turns}\n\n"
 
-    messages = [{
-        "role": "user",
-        "content": f"SCHEMA:\n{schema_text}\n{convo_context}\nQUESTION: {question}",
-    }]
+    messages = [{"role": "user", "content": f"{convo_context}QUESTION: {question}"}]
 
     last_sql, last_df, last_error = None, None, None
     retries = 0
     explanation = None
+    chart_choice = None
 
-    for _ in range(MAX_RETRIES + 2):
+    for _ in range(MAX_STEPS):
         resp = client.messages.create(
             model=MODEL, max_tokens=800, system=AGENT_SYSTEM_PROMPT,
             tools=TOOLS, messages=messages,
@@ -190,8 +219,21 @@ def _run_agent(question: str, db_path: str, history: list) -> dict:
 
         tool_results = []
         finished = False
+        retries_exhausted = False
         for call in calls:
-            if call.name == "execute_sql":
+            if call.name == "list_tables":
+                content = json.dumps(list_tables_with_counts(db_path))
+                tool_results.append({"type": "tool_result", "tool_use_id": call.id, "content": content})
+
+            elif call.name == "describe_table":
+                table = call.input.get("table", "")
+                try:
+                    content = get_table_schema(db_path, table)
+                    tool_results.append({"type": "tool_result", "tool_use_id": call.id, "content": content})
+                except ValueError as e:
+                    tool_results.append({"type": "tool_result", "tool_use_id": call.id, "content": str(e), "is_error": True})
+
+            elif call.name == "execute_sql":
                 sql = call.input.get("sql", "")
                 payload, df, error = _execute_tool(sql, db_path)
                 last_sql = sql
@@ -200,6 +242,7 @@ def _run_agent(question: str, db_path: str, history: list) -> dict:
                 else:
                     last_error = error
                     if retries >= MAX_RETRIES:
+                        retries_exhausted = True
                         payload = {
                             **payload,
                             "note": "No retries left. Do not call execute_sql again - "
@@ -212,27 +255,51 @@ def _run_agent(question: str, db_path: str, history: list) -> dict:
                     "content": json.dumps(payload, default=str),
                     "is_error": error is not None,
                 })
+
+            elif call.name == "visualize":
+                if last_df is None or last_error is not None:
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": call.id,
+                        "content": "No successful query result yet - call execute_sql first.",
+                        "is_error": True,
+                    })
+                else:
+                    chart = call.input.get("chart")
+                    chart_choice = {
+                        "chart": chart if chart in CHART_TYPES else "table",
+                        "x": call.input.get("x"), "y": call.input.get("y"),
+                        "color": call.input.get("color"), "reason": call.input.get("reason", ""),
+                    }
+                    tool_results.append({"type": "tool_result", "tool_use_id": call.id, "content": "ok"})
+
             elif call.name == "finish":
-                explanation = call.input.get("explanation")
-                finished = True
-                tool_results.append({"type": "tool_result", "tool_use_id": call.id, "content": "ok"})
+                if last_df is None or last_error is not None:
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": call.id,
+                        "content": "No successful query result yet - call execute_sql first.",
+                        "is_error": True,
+                    })
+                else:
+                    explanation = call.input.get("explanation")
+                    finished = True
+                    tool_results.append({"type": "tool_result", "tool_use_id": call.id, "content": "ok"})
 
         messages.append({"role": "user", "content": tool_results})
 
         if finished:
             break
-        if last_error is not None and retries > MAX_RETRIES:
+        if retries_exhausted:
             break
 
     if last_df is not None and last_error is None:
         return {
             "sql": last_sql, "result": last_df, "error": None, "mode": "live",
-            "retries": retries, "explanation": explanation,
+            "retries": retries, "explanation": explanation, "chart": chart_choice,
         }
     return {
         "sql": last_sql, "result": None,
         "error": last_error or "The agent could not produce a working query.",
-        "mode": "live", "retries": retries, "explanation": None,
+        "mode": "live", "retries": retries, "explanation": None, "chart": None,
     }
 
 

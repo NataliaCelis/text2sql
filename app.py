@@ -1,12 +1,12 @@
 import os
 import streamlit as st
 import pandas as pd
-from sql_engine import ask, run_sql, validate_sql, suggest_questions, DB_PATH
+from sql_engine import ask, run_sql, validate_sql, suggest_questions, DB_PATH, CHART_TYPES
 from query_log import get_recent_queries
 from data_loader import read_uploaded_file, build_session_db, UploadError
 from schema import get_table_names
 from profiling import get_preview, get_row_count, get_column_profile
-from visualization import choose_chart, heuristic_chart, render_chart, CHART_TYPES
+from visualization import heuristic_chart, render_chart
 
 st.set_page_config(page_title="Text-to-SQL Analyst", page_icon="💻", layout="wide")
 
@@ -134,12 +134,11 @@ with tab_ask:
         if not q:
             st.warning("Enter a question first.")
         else:
-            with st.spinner("Generating SQL and running query..."):
+            with st.spinner("Exploring the schema, generating SQL, and running the query..."):
                 result = ask(q, db_path=st.session_state.active_db, history=st.session_state.history)
-            chart_choice = None
-            if result["error"] is None and result["result"] is not None and not result["result"].empty:
-                with st.spinner("Picking the best way to visualize this..."):
-                    chart_choice = choose_chart(q, result["sql"], result["result"])
+            chart_choice = result.pop("chart", None)
+            if not chart_choice and result["error"] is None and result["result"] is not None and not result["result"].empty:
+                chart_choice = heuristic_chart(result["result"])
             st.session_state.turns.append({"question": q, "chart_choice": chart_choice, **result})
             if result["sql"] and result["error"] is None:
                 st.session_state.history.append({"question": q, "sql": result["sql"]})
@@ -240,9 +239,9 @@ with tab_history:
             if st.button("Ask this again", key=f"rerun_{ts}_{q[:20]}"):
                 with st.spinner("Re-running..."):
                     result = ask(q, db_path=st.session_state.active_db, history=st.session_state.history)
-                chart_choice = None
-                if result["error"] is None and result["result"] is not None and not result["result"].empty:
-                    chart_choice = choose_chart(q, result["sql"], result["result"])
+                chart_choice = result.pop("chart", None)
+                if not chart_choice and result["error"] is None and result["result"] is not None and not result["result"].empty:
+                    chart_choice = heuristic_chart(result["result"])
                 st.session_state.turns.append({"question": q, "chart_choice": chart_choice, **result})
                 st.rerun()
 
@@ -255,19 +254,22 @@ with st.expander("How this works / safety notes"):
   question since they land in the same database.
 - **Data Preview tab**: browse any table's row/column counts, per-column dtype/null/distinct
   stats, and a sample of rows before you even ask a question.
-- **Agentic loop**: the database schema (+ up to 3 prior conversation turns, for follow-ups)
-  and your question are sent to Claude, which drives its own `execute_sql` / `finish` tool
-  loop — it writes a query, sees the real result (or database error) come back, and decides
-  for itself whether to retry with a fix or stop once the result actually answers the question.
+- **Agentic loop**: Claude isn't handed the schema up front — given your question (+ up to 3
+  prior turns, for follow-ups), it calls its own tools to work the problem: `list_tables` and
+  `describe_table` to explore only what's relevant, `execute_sql` to run a query and see the
+  real result or database error come back, `visualize` to pick a chart type and axes once a
+  result answers the question, and `finish` to end the turn with a plain-English explanation.
+  It decides which tools to call, in what order, and when to retry — the loop just enforces
+  the ground rules and a hard cap on tool calls.
 - Before every `execute_sql` call, the query is validated: **only `SELECT` statements are
   allowed** — any `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, etc. is rejected, and
   multi-statement queries are blocked. The same validation applies if you manually edit and
   re-run a query — the model calling the tool never bypasses this check.
 - **Self-healing retries**: if a query fails to execute, the database error is fed back to the
   model as the tool result, and it gets up to 2 attempts to fix it before giving up.
-- **Agentic visualization**: once a query succeeds, a second Claude call looks at the question
-  and the shape of the result and picks a chart type and axes (or "table" when a chart wouldn't
-  help) — rendered as an interactive Plotly chart with hover, zoom, and a manual override.
+- **Interactive charts**: the agent's own `visualize` call picks the chart type and axes (or
+  "table" when a chart wouldn't help), rendered with Plotly for hover, zoom, and a manual
+  override — with a simple heuristic fallback in offline demo mode.
 - Every query is logged (question, SQL, mode, success/failure, retry count) — see the sidebar
   or the Full History tab, which also lets you re-run any past question.
 - Demo database: [Chinook](https://github.com/lerocha/chinook-database) (a music store).
