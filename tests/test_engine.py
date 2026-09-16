@@ -1,13 +1,17 @@
-"""Test suite: safety validation, demo fallback, and end-to-end execution.
+"""Test suite: safety validation, demo fallback, the agentic tool-use loop,
+and end-to-end execution.
 Run with: pytest tests/ -v
 Tests that need a live API key are skipped automatically when
-ANTHROPIC_API_KEY isn't set, so this suite runs cleanly in CI."""
+ANTHROPIC_API_KEY isn't set, so this suite runs cleanly in CI. The agent-loop
+tests instead fake the Claude client, so they exercise the real retry/finish
+logic deterministically without any network access."""
 import os
 import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import sql_engine
 from sql_engine import validate_sql, run_sql, ask
 from demo_fallback import match_demo_query
 
@@ -100,3 +104,80 @@ def test_ask_live_mode_generates_valid_sql():
     assert result["mode"] == "live"
     assert result["error"] is None
     assert result["result"].shape[0] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Agentic tool-use loop - fakes the Claude client so the real retry/finish
+# logic in sql_engine._run_agent runs deterministically, with no network.
+# ---------------------------------------------------------------------------
+class FakeBlock:
+    def __init__(self, type_, name=None, id=None, input=None):
+        self.type = type_
+        self.name = name
+        self.id = id
+        self.input = input or {}
+
+
+class FakeResponse:
+    def __init__(self, content):
+        self.content = content
+
+
+class FakeMessages:
+    def __init__(self, responses):
+        self._responses = iter(responses)
+
+    def create(self, **kwargs):
+        return next(self._responses)
+
+
+class FakeClient:
+    def __init__(self, responses):
+        self.messages = FakeMessages(responses)
+
+
+def test_run_agent_self_heals_after_execution_error(monkeypatch):
+    responses = [
+        FakeResponse([FakeBlock("tool_use", name="execute_sql", id="1", input={"sql": "SELECT * FROM NoSuchTable"})]),
+        FakeResponse([FakeBlock("tool_use", name="execute_sql", id="2", input={"sql": "SELECT COUNT(*) AS n FROM Customer"})]),
+        FakeResponse([FakeBlock("tool_use", name="finish", id="3", input={"explanation": "Counts all customers."})]),
+    ]
+    monkeypatch.setattr(sql_engine, "_client", lambda: FakeClient(responses))
+
+    result = sql_engine._run_agent("how many customers are there", sql_engine.DB_PATH, None)
+
+    assert result["error"] is None
+    assert result["retries"] == 1
+    assert result["explanation"] == "Counts all customers."
+    assert result["result"]["n"].iloc[0] > 0
+
+
+def test_run_agent_enforces_select_only_even_if_model_tries_unsafe_sql(monkeypatch):
+    """The execute_sql tool independently re-validates every query - a model
+    that tries DROP/DELETE/etc. gets a rejection back as a tool error, not a
+    mutated database."""
+    responses = [
+        FakeResponse([FakeBlock("tool_use", name="execute_sql", id="1", input={"sql": "DROP TABLE Customer"})]),
+        FakeResponse([FakeBlock("tool_use", name="execute_sql", id="2", input={"sql": "SELECT COUNT(*) AS n FROM Customer"})]),
+        FakeResponse([FakeBlock("tool_use", name="finish", id="3", input={"explanation": "ok"})]),
+    ]
+    monkeypatch.setattr(sql_engine, "_client", lambda: FakeClient(responses))
+
+    result = sql_engine._run_agent("drop the customer table", sql_engine.DB_PATH, None)
+
+    assert result["retries"] == 1
+    assert result["error"] is None
+    row_count = run_sql("SELECT COUNT(*) AS n FROM Customer")["n"].iloc[0]
+    assert row_count > 0  # table still exists - the DROP never reached the database
+
+
+def test_run_agent_gives_up_after_max_retries(monkeypatch):
+    bad_call = lambda i: FakeResponse([FakeBlock("tool_use", name="execute_sql", id=str(i), input={"sql": "SELECT * FROM NoSuchTable"})])
+    responses = [bad_call(i) for i in range(sql_engine.MAX_RETRIES + 2)]
+    monkeypatch.setattr(sql_engine, "_client", lambda: FakeClient(responses))
+
+    result = sql_engine._run_agent("a question the model can't answer", sql_engine.DB_PATH, None)
+
+    assert result["error"] is not None
+    assert result["result"] is None
+    assert result["retries"] == sql_engine.MAX_RETRIES

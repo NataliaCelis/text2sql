@@ -6,6 +6,7 @@ from query_log import get_recent_queries
 from data_loader import read_uploaded_file, build_session_db, UploadError
 from schema import get_table_names
 from profiling import get_preview, get_row_count, get_column_profile
+from visualization import choose_chart, heuristic_chart, render_chart, CHART_TYPES
 
 st.set_page_config(page_title="Text-to-SQL Analyst", page_icon="💻", layout="wide")
 
@@ -135,7 +136,11 @@ with tab_ask:
         else:
             with st.spinner("Generating SQL and running query..."):
                 result = ask(q, db_path=st.session_state.active_db, history=st.session_state.history)
-            st.session_state.turns.append({"question": q, **result})
+            chart_choice = None
+            if result["error"] is None and result["result"] is not None and not result["result"].empty:
+                with st.spinner("Picking the best way to visualize this..."):
+                    chart_choice = choose_chart(q, result["sql"], result["result"])
+            st.session_state.turns.append({"question": q, "chart_choice": chart_choice, **result})
             if result["sql"] and result["error"] is None:
                 st.session_state.history.append({"question": q, "sql": result["sql"]})
             st.rerun()
@@ -168,19 +173,21 @@ with tab_ask:
                         file_name="query_result.csv", mime="text/csv", key=f"dl_{i}",
                     )
 
-                if df.shape[1] == 2 and df.shape[0] > 1 and pd.api.types.is_numeric_dtype(df[df.columns[1]]):
-                    chart_type = st.radio(
-                        "Chart type", ["Bar", "Line", "Area"], horizontal=True,
-                        key=f"chart_{i}", label_visibility="collapsed",
+                chart_choice = turn.get("chart_choice")
+                if chart_choice and chart_choice.get("chart") != "table" and not df.empty:
+                    options = sorted(CHART_TYPES - {"table"})
+                    default_idx = options.index(chart_choice["chart"]) if chart_choice["chart"] in options else 0
+                    picked = st.selectbox(
+                        "Chart type (auto-picked by the agent, override if you like)",
+                        options, index=default_idx, key=f"charttype_{i}",
                     )
-                    label_col, value_col = df.columns[0], df.columns[1]
-                    chart_df = df.set_index(label_col)[value_col]
-                    if chart_type == "Bar":
-                        st.bar_chart(chart_df)
-                    elif chart_type == "Line":
-                        st.line_chart(chart_df)
+                    fig = render_chart(df, {**chart_choice, "chart": picked})
+                    if fig is not None:
+                        st.plotly_chart(fig, use_container_width=True, key=f"chart_{i}")
+                        if chart_choice.get("reason"):
+                            st.caption(f"Why this chart: {chart_choice['reason']}")
                     else:
-                        st.area_chart(chart_df)
+                        st.info("Couldn't render that chart type for these columns.")
 
                 with st.expander("Edit & re-run this SQL"):
                     edited = st.text_area("SQL", value=turn["sql"], key=f"edit_{i}", height=100, label_visibility="collapsed")
@@ -189,6 +196,9 @@ with tab_ask:
                             validate_sql(edited)
                             edited_df = run_sql(edited, db_path=st.session_state.active_db)
                             st.dataframe(edited_df, use_container_width=True)
+                            edited_fig = render_chart(edited_df, heuristic_chart(edited_df))
+                            if edited_fig is not None:
+                                st.plotly_chart(edited_fig, use_container_width=True, key=f"edit_chart_{i}")
                         except Exception as e:
                             st.error(str(e))
 
@@ -230,7 +240,10 @@ with tab_history:
             if st.button("Ask this again", key=f"rerun_{ts}_{q[:20]}"):
                 with st.spinner("Re-running..."):
                     result = ask(q, db_path=st.session_state.active_db, history=st.session_state.history)
-                st.session_state.turns.append({"question": q, **result})
+                chart_choice = None
+                if result["error"] is None and result["result"] is not None and not result["result"].empty:
+                    chart_choice = choose_chart(q, result["sql"], result["result"])
+                st.session_state.turns.append({"question": q, "chart_choice": chart_choice, **result})
                 st.rerun()
 
 st.divider()
@@ -242,13 +255,19 @@ with st.expander("How this works / safety notes"):
   question since they land in the same database.
 - **Data Preview tab**: browse any table's row/column counts, per-column dtype/null/distinct
   stats, and a sample of rows before you even ask a question.
-- The database schema (+ up to 3 prior conversation turns, for follow-ups) is sent to Claude
-  along with your question, which returns a single SQL query.
-- Before execution, the query is validated: **only `SELECT` statements are allowed** — any
-  `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, etc. is rejected, and multi-statement queries
-  are blocked. The same validation applies if you manually edit and re-run a query.
-- **Self-healing retries**: if the query fails to execute, the database error is fed back to
-  the model, which gets up to 2 attempts to fix it before giving up.
+- **Agentic loop**: the database schema (+ up to 3 prior conversation turns, for follow-ups)
+  and your question are sent to Claude, which drives its own `execute_sql` / `finish` tool
+  loop — it writes a query, sees the real result (or database error) come back, and decides
+  for itself whether to retry with a fix or stop once the result actually answers the question.
+- Before every `execute_sql` call, the query is validated: **only `SELECT` statements are
+  allowed** — any `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, etc. is rejected, and
+  multi-statement queries are blocked. The same validation applies if you manually edit and
+  re-run a query — the model calling the tool never bypasses this check.
+- **Self-healing retries**: if a query fails to execute, the database error is fed back to the
+  model as the tool result, and it gets up to 2 attempts to fix it before giving up.
+- **Agentic visualization**: once a query succeeds, a second Claude call looks at the question
+  and the shape of the result and picks a chart type and axes (or "table" when a chart wouldn't
+  help) — rendered as an interactive Plotly chart with hover, zoom, and a manual override.
 - Every query is logged (question, SQL, mode, success/failure, retry count) — see the sidebar
   or the Full History tab, which also lets you re-run any past question.
 - Demo database: [Chinook](https://github.com/lerocha/chinook-database) (a music store).

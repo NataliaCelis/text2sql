@@ -1,8 +1,18 @@
-"""Core engine: natural language -> SQL -> validated -> executed.
-v2: adds self-healing retries on execution error, multi-turn conversation
-context, plain-English SQL explanation, and query history logging."""
+"""Core engine: an agentic pipeline that turns a natural-language question into
+validated, executed SQL.
+
+Rather than a hard-coded generate -> execute -> retry loop, the model drives an
+explicit tool-use loop: it calls the execute_sql tool with its query, sees the
+real database error (or a preview of the result) come back as the tool result,
+and decides for itself whether to retry with a corrected query or call finish
+once the result actually answers the question. Every execute_sql call is
+independently validated (SELECT-only, single statement) before it ever touches
+the database - the model choosing to call the tool doesn't bypass that check -
+and the loop is hard-capped at MAX_RETRIES so a stubborn model can't spin
+forever."""
 import os
 import re
+import json
 import sqlite3
 import pandas as pd
 from schema import get_schema_text
@@ -10,22 +20,73 @@ from query_log import log_query
 
 DB_PATH = "data/chinook.db"
 MAX_RETRIES = 2
+MODEL = "claude-sonnet-5"
 
-SYSTEM_PROMPT = """You are a SQL generator for a SQLite database. Given a schema and a
-question, output ONLY a single valid SQLite SELECT query that answers the question.
+AGENT_SYSTEM_PROMPT = """You are a SQL analytics agent for a SQLite database. You
+answer business questions by calling tools - you never just print SQL as plain text.
+
+Workflow:
+1. Call execute_sql with a single SQLite SELECT query that answers the question.
+2. Look at what comes back:
+   - If it's an error, read it, fix the query, and call execute_sql again.
+   - If it's a result, decide whether it actually answers the question. If not
+     (wrong grouping, wrong columns, empty when it shouldn't be), fix the query
+     and call execute_sql again.
+3. Once a result correctly answers the question, call finish with a short,
+   plain-English explanation of what the query computes (for a non-technical
+   business stakeholder - no SQL jargon, no restating the query syntax).
+
 Rules:
-- Output ONLY the SQL query, no explanation, no markdown code fences, no comments.
-- Only generate SELECT statements. Never INSERT, UPDATE, DELETE, DROP, ALTER, etc.
+- Only SELECT queries. Never INSERT, UPDATE, DELETE, DROP, ALTER, etc. - these
+  are rejected before they ever reach the database.
 - Use table/column names exactly as given in the schema.
-- If the question is ambiguous, make a reasonable assumption and answer it.
 - If prior conversation turns are given, use them to resolve references like
   "that", "those", "the same but by X" in the current question.
 - Limit results to 100 rows unless the question implies otherwise (add LIMIT 100).
+- You have a limited number of execute_sql attempts - make each one count.
 """
 
-EXPLAIN_SYSTEM_PROMPT = """Explain the given SQL query in one or two short, plain-English
-sentences a non-technical business stakeholder would understand. No jargon, no
-restating the SQL syntax itself - describe what it computes."""
+TOOLS = [
+    {
+        "name": "execute_sql",
+        "description": (
+            "Validates (SELECT-only, single statement) and executes a SQLite "
+            "query against the target database. Returns the row count, column "
+            "names, and up to 20 sample rows on success, or the raw database "
+            "error message on failure."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sql": {"type": "string", "description": "A single SQLite SELECT statement."}
+            },
+            "required": ["sql"],
+        },
+    },
+    {
+        "name": "finish",
+        "description": (
+            "Call this once an execute_sql call has succeeded and its result "
+            "correctly answers the question. Ends the turn."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "explanation": {
+                    "type": "string",
+                    "description": "One or two short, plain-English sentences describing what the query computes.",
+                }
+            },
+            "required": ["explanation"],
+        },
+    },
+]
+
+SUGGEST_SYSTEM_PROMPT = """Given a SQLite schema, suggest 4 interesting, specific business
+questions a user could ask about this data. Output ONLY the 4 questions, one per line,
+no numbering, no bullets, no extra commentary. Make them concrete (reference actual
+column/table names in spirit, not literally) and varied (aggregation, ranking, trend,
+comparison)."""
 
 FORBIDDEN = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|REPLACE|TRUNCATE|ATTACH|PRAGMA|VACUUM)\b",
@@ -53,65 +114,6 @@ def _client():
     return anthropic.Anthropic(api_key=api_key)
 
 
-def generate_sql(question: str, db_path: str = None, history: list = None, prior_error: str = None, prior_sql: str = None) -> str:
-    """Calls Claude to translate a question into SQL.
-    db_path: which SQLite DB's schema to use as context (defaults to Chinook).
-    history: list of {"question": str, "sql": str} from earlier turns, for
-             multi-turn follow-up questions.
-    prior_error/prior_sql: when retrying after a failed execution, passes the
-             broken SQL and the DB error back so the model can fix it."""
-    client = _client()
-    schema_text = get_schema_text(db_path or DB_PATH)
-
-    convo_context = ""
-    if history:
-        turns = "\n".join(f"Q: {h['question']}\nSQL: {h['sql']}" for h in history[-3:])
-        convo_context = f"\nPRIOR CONVERSATION (for resolving references):\n{turns}\n"
-
-    if prior_error:
-        user_prompt = (
-            f"SCHEMA:\n{schema_text}\n{convo_context}\n"
-            f"QUESTION: {question}\n\n"
-            f"Your previous attempt failed. Fix it.\n"
-            f"PREVIOUS SQL:\n{prior_sql}\n"
-            f"DATABASE ERROR:\n{prior_error}\n\n"
-            f"Corrected SQL:"
-        )
-    else:
-        user_prompt = f"SCHEMA:\n{schema_text}\n{convo_context}\nQUESTION: {question}\n\nSQL:"
-
-    resp = client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=400,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}],
-    )
-    return _strip_code_fences(resp.content[0].text)
-
-
-def explain_sql(sql: str) -> str:
-    """Plain-English explanation of a query. Returns None in demo mode
-    (no API key) rather than failing the whole pipeline over a nice-to-have."""
-    try:
-        client = _client()
-    except SQLGenerationError:
-        return None
-    resp = client.messages.create(
-        model="claude-sonnet-5",
-        max_tokens=150,
-        system=EXPLAIN_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": sql}],
-    )
-    return resp.content[0].text.strip()
-
-
-SUGGEST_SYSTEM_PROMPT = """Given a SQLite schema, suggest 4 interesting, specific business
-questions a user could ask about this data. Output ONLY the 4 questions, one per line,
-no numbering, no bullets, no extra commentary. Make them concrete (reference actual
-column/table names in spirit, not literally) and varied (aggregation, ranking, trend,
-comparison)."""
-
-
 def suggest_questions(db_path: str) -> list:
     """Returns 4 example questions tailored to the given DB's schema.
     Returns [] in demo mode (no API key)."""
@@ -121,7 +123,7 @@ def suggest_questions(db_path: str) -> list:
         return []
     schema_text = get_schema_text(db_path)
     resp = client.messages.create(
-        model="claude-sonnet-5",
+        model=MODEL,
         max_tokens=200,
         system=SUGGEST_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": f"SCHEMA:\n{schema_text}"}],
@@ -152,20 +154,115 @@ def run_sql(sql: str, db_path: str = DB_PATH) -> pd.DataFrame:
     return df
 
 
+def _execute_tool(sql: str, db_path: str):
+    """Runs one execute_sql tool call. Returns (tool_result_payload, df, error)."""
+    try:
+        validate_sql(sql)
+        df = run_sql(sql, db_path=db_path)
+        payload = {
+            "success": True,
+            "row_count": len(df),
+            "columns": list(df.columns),
+            "sample_rows": json.loads(df.head(20).to_json(orient="records", date_format="iso")),
+        }
+        return payload, df, None
+    except Exception as e:
+        error = str(e)
+        return {"success": False, "error": error}, None, error
+
+
+def _run_agent(question: str, db_path: str, history: list) -> dict:
+    """Drives the execute_sql/finish tool-use loop against Claude.
+    Returns an ask()-shaped dict with mode='live'. Raises SQLGenerationError
+    if no API key is configured (caller falls back to demo mode)."""
+    client = _client()
+    schema_text = get_schema_text(db_path)
+
+    convo_context = ""
+    if history:
+        turns = "\n".join(f"Q: {h['question']}\nSQL: {h['sql']}" for h in history[-3:])
+        convo_context = f"\nPRIOR CONVERSATION (for resolving references):\n{turns}\n"
+
+    messages = [{
+        "role": "user",
+        "content": f"SCHEMA:\n{schema_text}\n{convo_context}\nQUESTION: {question}",
+    }]
+
+    last_sql, last_df, last_error = None, None, None
+    retries = 0
+    explanation = None
+
+    # +2 headroom so the model can still call finish right after its last retry succeeds
+    for _ in range(MAX_RETRIES + 2):
+        resp = client.messages.create(
+            model=MODEL, max_tokens=800, system=AGENT_SYSTEM_PROMPT,
+            tools=TOOLS, messages=messages,
+        )
+        messages.append({"role": "assistant", "content": resp.content})
+
+        calls = [b for b in resp.content if b.type == "tool_use"]
+        if not calls:
+            break  # model didn't call a tool - nothing more we can drive
+
+        tool_results = []
+        finished = False
+        for call in calls:
+            if call.name == "execute_sql":
+                sql = call.input.get("sql", "")
+                payload, df, error = _execute_tool(sql, db_path)
+                last_sql = sql
+                if error is None:
+                    last_df, last_error = df, None
+                else:
+                    last_error = error
+                    if retries >= MAX_RETRIES:
+                        payload = {
+                            **payload,
+                            "note": "No retries left. Do not call execute_sql again - "
+                                     "report the failure in plain text instead.",
+                        }
+                    else:
+                        retries += 1
+                tool_results.append({
+                    "type": "tool_result", "tool_use_id": call.id,
+                    "content": json.dumps(payload, default=str),
+                    "is_error": error is not None,
+                })
+            elif call.name == "finish":
+                explanation = call.input.get("explanation")
+                finished = True
+                tool_results.append({"type": "tool_result", "tool_use_id": call.id, "content": "ok"})
+
+        messages.append({"role": "user", "content": tool_results})
+
+        if finished:
+            break
+        if last_error is not None and retries > MAX_RETRIES:
+            break
+
+    if last_df is not None and last_error is None:
+        return {
+            "sql": last_sql, "result": last_df, "error": None, "mode": "live",
+            "retries": retries, "explanation": explanation,
+        }
+    return {
+        "sql": last_sql, "result": None,
+        "error": last_error or "The agent could not produce a working query.",
+        "mode": "live", "retries": retries, "explanation": None,
+    }
+
+
 def ask(question: str, db_path: str = None, history: list = None) -> dict:
-    """Full pipeline: question -> SQL -> validated -> executed -> result,
-    with up to MAX_RETRIES self-healing attempts on execution failure.
+    """Full pipeline: question -> agentic tool-use loop -> validated, executed SQL.
     db_path: which SQLite DB to query (defaults to the Chinook demo DB).
     Returns dict: sql, result, error, mode, retries, explanation."""
     active_db = db_path or DB_PATH
     try:
-        sql = generate_sql(question, db_path=active_db, history=history)
-        mode = "live"
+        result = _run_agent(question, active_db, history)
     except SQLGenerationError:
         from demo_fallback import match_demo_query
         # demo fallback only makes sense against the built-in Chinook DB
         sql = match_demo_query(question) if active_db == DB_PATH else None
-        mode = "demo"
         if sql is None:
             log_query(question, None, "demo", success=False, error="no demo match")
             reason = (
@@ -181,33 +278,22 @@ def ask(question: str, db_path: str = None, history: list = None) -> dict:
                 "sql": None, "result": None, "explanation": None, "retries": 0,
                 "error": reason, "mode": "demo",
             }
-
-    retries = 0
-    last_error = None
-    while True:
         try:
             df = run_sql(sql, db_path=active_db)
-            explanation = explain_sql(sql) if mode == "live" else None
-            log_query(question, sql, mode, success=True, retries=retries)
+            log_query(question, sql, "demo", success=True, retries=0)
             return {
-                "sql": sql, "result": df, "error": None, "mode": mode,
-                "retries": retries, "explanation": explanation,
+                "sql": sql, "result": df, "error": None, "mode": "demo",
+                "retries": 0, "explanation": None,
             }
         except Exception as e:
-            last_error = str(e)
-            if mode != "live" or retries >= MAX_RETRIES:
-                log_query(question, sql, mode, success=False, retries=retries, error=last_error)
-                return {
-                    "sql": sql, "result": None, "error": last_error, "mode": mode,
-                    "retries": retries, "explanation": None,
-                }
-            # self-healing retry: feed the error back to the model
-            retries += 1
-            try:
-                sql = generate_sql(question, db_path=active_db, history=history, prior_error=last_error, prior_sql=sql)
-            except SQLGenerationError:
-                log_query(question, sql, mode, success=False, retries=retries, error=last_error)
-                return {
-                    "sql": sql, "result": None, "error": last_error, "mode": mode,
-                    "retries": retries, "explanation": None,
-                }
+            log_query(question, sql, "demo", success=False, retries=0, error=str(e))
+            return {
+                "sql": sql, "result": None, "error": str(e), "mode": "demo",
+                "retries": 0, "explanation": None,
+            }
+
+    if result["error"] is None:
+        log_query(question, result["sql"], result["mode"], success=True, retries=result["retries"])
+    else:
+        log_query(question, result["sql"], result["mode"], success=False, retries=result["retries"], error=result["error"])
+    return result
